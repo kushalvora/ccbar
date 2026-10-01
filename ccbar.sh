@@ -202,7 +202,10 @@ CTX_SIZE=${CTX_SIZE:-200000}
 fmt_k() {
   local n=$1
   if [[ $n -ge 1000000 ]]; then
-    printf "%.1fM" "$(echo "scale=1; $n/1000000" | bc)"
+    # scale=3 so printf does the rounding; bc truncates, and at scale=1 that
+    # turned 48.58M into 48.5M. The k branch below is unaffected because %.0f
+    # already rounds bc's single decimal.
+    printf "%.1fM" "$(echo "scale=3; $n/1000000" | bc)"
   elif [[ $n -ge 1000 ]]; then
     printf "%.0fk" "$(echo "scale=1; $n/1000" | bc)"
   else
