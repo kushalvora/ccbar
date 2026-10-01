@@ -30,6 +30,7 @@ That's it. Start a new Claude Code session to see the statusline.
 | Token count | Dim | Used and total tokens (e.g. 44k/200k) |
 | Model | Gold | Model name from session data |
 | Cost | Green | Cumulative session cost in USD |
+| Subagents | Mauve | Count, combined tokens and API-list value of subagents (`⊂3 48.6M $52.50`); hidden when none have run |
 | Duration | Light gray | Total session wall-clock time |
 | Speed | Light blue | Output token throughput in tokens/second |
 
@@ -76,6 +77,30 @@ Your config at `~/.config/ccbar/config` is preserved. To remove it as well:
 ```bash
 curl -sSfL https://raw.githubusercontent.com/dipenchovatiya/ccbar/main/install.sh | bash -s -- --uninstall --purge
 ```
+
+## The Subagent Widget
+
+Claude Code keeps each subagent's turns in a sidecar file and never folds them into the main transcript:
+
+```
+~/.claude/projects/<project>/<session-id>.jsonl              <- main thread
+~/.claude/projects/<project>/<session-id>/subagents/*.jsonl  <- one per subagent
+```
+
+Subagents also get their own context windows, so their tokens never appear in the context bar. That is the point of delegating work to them, and it is why they need a separate readout.
+
+ccbar parses those sidecar files and prices the usage at Anthropic's published API rates, split across input, output, cache read, and the two cache-write tiers.
+
+**The dollar amount is API-list value, not a bill.** It is what that work would cost at list prices. On a subscription plan you pay the plan price instead.
+
+Two details matter for correctness, both verified against real transcripts:
+
+- A single API turn is written across several lines as streaming snapshots. Within one `message.id` the input and cache counts repeat verbatim while `output_tokens` grows, so the parse groups by `message.id`, takes input and cache once, and takes the maximum output. Summing raw lines overcounts by roughly 2x. `requestId` is `null` in these files, so it cannot serve as the key.
+- Cache writes bill at two different rates, tracked separately as `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`.
+
+Results are cached in `~/.claude/cache/`, keyed on file count, total size and newest mtime, so a turn with no new subagent activity costs a single `stat`. Model prices live in a table at the top of `ccbar.sh`; override it by pointing `CCBAR_PRICES` at a JSON file in the same shape, or by creating `~/.config/ccbar/prices.json`.
+
+Turn the widget off entirely with `SHOW_SUBAGENTS=false`.
 
 ## How It Works
 

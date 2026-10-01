@@ -27,10 +27,16 @@ SHOW_DURATION=true
 SHOW_SPEED=true
 SHOW_WORKTREE=true
 SHOW_GIT_SYNC=true
+SHOW_SUBAGENTS=true
 
 BAR_WIDTH=20
 THRESHOLD_MID=40
 THRESHOLD_HIGH=80
+
+# Subagent scan guards: skip the parse above this many bytes of transcript, and
+# hard-kill it after this many seconds so the statusline can never hang.
+SUBAGENT_MAX_BYTES=80000000
+SUBAGENT_TIMEOUT=3
 
 COLOR_BRANCH=141
 COLOR_GIT_STATUS=209
@@ -42,6 +48,7 @@ COLOR_SPEED=111
 COLOR_WORKTREE=179
 COLOR_GIT_SYNC=215
 COLOR_BAR_FILL=75
+COLOR_SUBAGENT=176
 COLOR_HEALTH_OK=114
 COLOR_HEALTH_MID=222
 COLOR_HEALTH_BAD=196
@@ -62,7 +69,7 @@ load_config() {
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
     case "$key" in
-      SHOW_*|BAR_WIDTH|THRESHOLD_*|COLOR_*|SEPARATOR|BRANCH_MAX_LEN) printf -v "$key" '%s' "$val" ;;
+      SHOW_*|BAR_WIDTH|THRESHOLD_*|COLOR_*|SEPARATOR|BRANCH_MAX_LEN|SUBAGENT_*) printf -v "$key" '%s' "$val" ;;
     esac
   done < "$cfg"
 }
@@ -82,6 +89,7 @@ C_SPEED="\033[38;5;${COLOR_SPEED}m"
 C_WORKTREE="\033[38;5;${COLOR_WORKTREE}m"
 C_GITSYNC="\033[38;5;${COLOR_GIT_SYNC}m"
 C_BAR_FILL="\033[38;5;${COLOR_BAR_FILL}m"
+C_SUBAGENT="\033[38;5;${COLOR_SUBAGENT}m"
 C_HEALTH_OK="\033[38;5;${COLOR_HEALTH_OK}m"
 C_HEALTH_MID="\033[38;5;${COLOR_HEALTH_MID}m"
 C_HEALTH_BAD="\033[38;5;${COLOR_HEALTH_BAD}m"
@@ -144,6 +152,123 @@ if [[ -n "$API_MS" && "$API_MS" != "null" && "$API_MS" -gt 0 ]] 2>/dev/null; the
   if [[ $OUT_TOK -gt 0 ]]; then
     TPS=$(( OUT_TOK * 1000 / API_MS ))
     SPEED="${TPS} t/s"
+  fi
+fi
+
+# -- Subagent usage ------------------------------------------------------------
+# Claude Code keeps each subagent's turns in a sidecar file and never folds them
+# into the main transcript, so they have to be read separately:
+#   <transcript>.jsonl              <- main thread
+#   <transcript>/subagents/*.jsonl  <- one file per subagent
+#
+# Two correctness notes, both verified against real transcripts:
+#  1. One API turn spans several lines (streaming snapshots). Within a
+#     message.id the input/cache counts repeat verbatim while output_tokens
+#     grows, so group by message.id, take input/cache once, take max output.
+#     Summing raw lines overcounts by roughly 2x. requestId is null here, so it
+#     cannot be the dedupe key.
+#  2. Cache writes bill at two tiers: ephemeral_5m and ephemeral_1h.
+#
+# Cost is API-list value, not a bill. On a subscription the plan price applies.
+SUB_PRICES='[
+ {"id":"claude-opus-5-5","input":4,"output":20,"cacheRead":0.2,"cacheWrite":5,"cacheWriteLong":8},
+ {"id":"claude-opus-5","input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25,"cacheWriteLong":10},
+ {"id":"claude-opus-4-8","input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25,"cacheWriteLong":10},
+ {"id":"claude-opus-4-7","input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25,"cacheWriteLong":10},
+ {"id":"claude-opus-4-6","input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25,"cacheWriteLong":10},
+ {"id":"claude-opus-4-5","input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25,"cacheWriteLong":10},
+ {"id":"claude-opus-4","input":15,"output":75,"cacheRead":1.5,"cacheWrite":18.75,"cacheWriteLong":30},
+ {"id":"claude-fable-5-1","input":10,"output":50,"cacheRead":0.25,"cacheWrite":12.5,"cacheWriteLong":20},
+ {"id":"claude-fable-5","input":10,"output":50,"cacheRead":1,"cacheWrite":12.5,"cacheWriteLong":20},
+ {"id":"claude-sonnet-5","input":2,"output":10,"cacheRead":0.2,"cacheWrite":2.5,"cacheWriteLong":4},
+ {"id":"claude-sonnet-4-6","input":3,"output":15,"cacheRead":0.3,"cacheWrite":3.75,"cacheWriteLong":6},
+ {"id":"claude-sonnet-4-5","input":3,"output":15,"cacheRead":0.3,"cacheWrite":3.75,"cacheWriteLong":6},
+ {"id":"claude-haiku-4-5","input":1,"output":5,"cacheRead":0.1,"cacheWrite":1.25,"cacheWriteLong":2}
+]'
+# Optional override: a JSON array in the same shape.
+SUB_PRICES_FILE="${CCBAR_PRICES:-$HOME/.config/ccbar/prices.json}"
+[[ -f "$SUB_PRICES_FILE" ]] && SUB_PRICES=$(cat "$SUB_PRICES_FILE" 2>/dev/null)
+
+SUB_AGENTS=0; SUB_TOKENS=0; SUB_COST=0
+
+sub_scan() { # $1 = subagents dir; emits "agents<TAB>tokens<TAB>cost"
+  local dir="$1" files n
+  files=$(find "$dir" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null)
+  [[ -z "$files" ]] && return 1
+  n=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
+  # shellcheck disable=SC2086
+  jq -s -r --argjson prices "$SUB_PRICES" --arg n "$n" '
+    [ .[] | select(.type == "assistant" and .message.usage != null) ]
+    | group_by(.message.id)
+    | map({
+        model: (.[0].message.model // ""),
+        inp:   (.[0].message.usage.input_tokens // 0),
+        cw5:   (.[0].message.usage.cache_creation.ephemeral_5m_input_tokens
+                  // .[0].message.usage.cache_creation_input_tokens // 0),
+        cw1:   (.[0].message.usage.cache_creation.ephemeral_1h_input_tokens // 0),
+        cr:    (.[0].message.usage.cache_read_input_tokens // 0),
+        out:   ([ .[].message.usage.output_tokens // 0 ] | max)
+      })
+    | map(.model as $m | . + { p: ([ $prices[]
+        | select(.id as $i | $m | startswith($i)) ] | sort_by(.id | length) | last) })
+    | { agents: ($n | tonumber),
+        tokens: ([ .[] | .inp + .cw5 + .cw1 + .cr + .out ] | add // 0),
+        cost:   ([ .[] | ( .inp * (.p.input          // 0)
+                         + .cw5 * (.p.cacheWrite     // 0)
+                         + .cw1 * (.p.cacheWriteLong // 0)
+                         + .cr  * (.p.cacheRead      // 0)
+                         + .out * (.p.output         // 0) ) / 1000000 ] | add // 0) }
+    | "\(.agents)\t\(.tokens)\t\(.cost)"
+  ' $files 2>/dev/null
+}
+
+if [[ "$SHOW_SUBAGENTS" == "true" ]]; then
+  TRANSCRIPT=$(jv '.transcript_path')
+  SUBDIR="${TRANSCRIPT%.jsonl}/subagents"
+  if [[ -n "$TRANSCRIPT" && -d "$SUBDIR" ]]; then
+    # Cache key: file count + cumulative size + newest mtime. Cheap to compute,
+    # and changes whenever any subagent writes, so a quiet render costs one stat.
+    # stat(1) differs between BSD/macOS and GNU/Linux, so pick the format once.
+    if stat -f '%z' /dev/null >/dev/null 2>&1; then
+      STAT_ARGS=(-f '%z %m')      # BSD
+    else
+      STAT_ARGS=(-c '%s %Y')      # GNU
+    fi
+    KEY=$(find "$SUBDIR" -maxdepth 1 -type f -name '*.jsonl' \
+            -exec stat "${STAT_ARGS[@]}" {} + 2>/dev/null \
+          | awk '{s+=$1; if ($2>m) m=$2; c++} END {print c"-"s"-"m}')
+    BYTES=${KEY#*-}; BYTES=${BYTES%-*}
+    CACHE_DIR="$HOME/.claude/cache"
+    CACHE_F="$CACHE_DIR/ccbar-sub-$(jv '.session_id')"
+    CACHED=""
+    [[ -f "$CACHE_F" ]] && CACHED=$(cat "$CACHE_F" 2>/dev/null)
+
+    if [[ -n "$CACHED" && "${CACHED%%|*}" == "$KEY" ]]; then
+      IFS=$'\t' read -r SUB_AGENTS SUB_TOKENS SUB_COST <<< "${CACHED#*|}"
+    elif [[ "${BYTES:-0}" -le "$SUBAGENT_MAX_BYTES" ]] 2>/dev/null; then
+      # Watchdog: no timeout(1) on stock macOS, so run the parse in the
+      # background and kill it if it overruns. A miss just skips the segment.
+      # Explicit template: bare `mktemp -t prefix` is not portable to GNU.
+      TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/ccbar-sub.XXXXXX" 2>/dev/null) || TMP_OUT=""
+      if [[ -n "$TMP_OUT" ]]; then
+        sub_scan "$SUBDIR" > "$TMP_OUT" 2>/dev/null &
+        SCAN_PID=$!
+        ( sleep "$SUBAGENT_TIMEOUT"; kill -9 "$SCAN_PID" 2>/dev/null ) 2>/dev/null &
+        WATCH_PID=$!
+        disown "$WATCH_PID" 2>/dev/null || true   # suppress the "Killed" job notice
+        wait "$SCAN_PID" 2>/dev/null
+        kill -9 "$WATCH_PID" 2>/dev/null
+        RESULT=$(cat "$TMP_OUT" 2>/dev/null)
+        rm -f "$TMP_OUT" 2>/dev/null
+        if [[ -n "$RESULT" ]]; then
+          IFS=$'\t' read -r SUB_AGENTS SUB_TOKENS SUB_COST <<< "$RESULT"
+          mkdir -p "$CACHE_DIR" 2>/dev/null
+          printf '%s|%s' "$KEY" "$RESULT" > "$CACHE_F" 2>/dev/null
+          # Prune stale entries. Only runs on a cache miss, so it is not hot.
+          find "$CACHE_DIR" -maxdepth 1 -name 'ccbar-sub-*' -mtime +7 -delete 2>/dev/null
+        fi
+      fi
+    fi
   fi
 fi
 
@@ -276,6 +401,12 @@ fi
 # Cost (green)
 if [[ "$SHOW_COST" == "true" ]]; then
   out+="${C_COST}${COST}${RESET}"
+fi
+
+# Subagents (mauve) — omitted entirely when none have run this session
+if [[ "$SHOW_SUBAGENTS" == "true" ]] && [[ "${SUB_AGENTS:-0}" -gt 0 ]] 2>/dev/null; then
+  SUB_COST_FMT=$(printf '$%.2f' "${SUB_COST:-0}" 2>/dev/null || echo "\$0.00")
+  out+="${SEP}${C_SUBAGENT}⊂${SUB_AGENTS} $(fmt_k "${SUB_TOKENS:-0}") ${SUB_COST_FMT}${RESET}"
 fi
 
 # Duration (light gray)

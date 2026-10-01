@@ -14,6 +14,13 @@ SHOW_DURATION=true
 SHOW_SPEED=true
 SHOW_WORKTREE=true
 SHOW_GIT_SYNC=true
+SHOW_SUBAGENTS=true
+
+# Subagents
+# Skip the transcript scan above this many bytes, and hard-kill it after this
+# many seconds, so the statusline can never hang on a huge session.
+SUBAGENT_MAX_BYTES=80000000
+SUBAGENT_TIMEOUT=3
 
 # Context bar
 BAR_WIDTH=20
@@ -31,6 +38,7 @@ COLOR_SPEED=111          # Light blue
 COLOR_WORKTREE=179       # Tan
 COLOR_GIT_SYNC=215       # Orange
 COLOR_BAR_FILL=75        # Blue
+COLOR_SUBAGENT=176       # Mauve
 COLOR_HEALTH_OK=114      # Green
 COLOR_HEALTH_MID=222     # Yellow
 COLOR_HEALTH_BAD=196     # Red
